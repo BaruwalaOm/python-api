@@ -19,7 +19,9 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,           # Specific frontend URLs
+     allow_origins=[
+        "https://caseconnecter-frontend.vercel.app"
+    ],         # Specific frontend URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
