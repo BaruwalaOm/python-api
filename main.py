@@ -14,14 +14,12 @@ app = FastAPI(title="Case Tracker API")
 origins = [
     "http://localhost:9002",  # React frontend
     "http://192.168.0.104:9002",
-    # You can add more allowed origins here
+    "https://caseconnecter-frontend.vercel.app",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-     allow_origins=[
-        "https://caseconnecter-frontend.vercel.app"
-    ],         # Specific frontend URLs
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
