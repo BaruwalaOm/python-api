@@ -114,14 +114,42 @@ async def get_all_users():
         users = []
         async for user in users_cursor:
             user["_id"] = str(user["_id"])
-            if user.get("advocate") and isinstance(user["advocate"], dict):
-                user["advocate"]["id"] = str(user["advocate"].get("id", ""))
+            user_id = user["_id"]
+
+            if str(user.get("role", "")).lower() == "advocate":
+                adv_doc = await db.advocates.find_one({
+                    "$or": [
+                        {"_id": ObjectId(user_id)},
+                        {"_id": user_id},
+                        {"userId": user_id},
+                        {"Id": user_id}
+                    ]
+                })
+                if adv_doc:
+                    enrollment_no = user.get("advocateEnrollmentNumber") or adv_doc.get("advocateEnrollmentNumber") or adv_doc.get("AdvocateUniqueNumber") or ""
+                    spec = user.get("specialization") or adv_doc.get("Specialization") or adv_doc.get("specialization") or ""
+                    user["advocateEnrollmentNumber"] = enrollment_no
+                    user["specialization"] = spec
+                    user["advocate"] = {
+                        "advocateEnrollmentNumber": enrollment_no,
+                        "specialization": spec,
+                        "Specialization": spec
+                    }
+                elif user.get("advocate") and isinstance(user["advocate"], dict):
+                    user["advocate"]["id"] = str(user["advocate"].get("id", ""))
+                    if not user.get("advocateEnrollmentNumber"):
+                        user["advocateEnrollmentNumber"] = user["advocate"].get("advocateEnrollmentNumber") or user["advocate"].get("AdvocateUniqueNumber") or ""
+                    if not user.get("specialization"):
+                        user["specialization"] = user["advocate"].get("Specialization") or user["advocate"].get("specialization") or ""
+
             users.append(user)
 
         return users
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching users: {str(e)}")
+
+
     
 @router.delete("/users/{user_id}", summary="Delete a user and related records")
 async def delete_user(user_id: str):
