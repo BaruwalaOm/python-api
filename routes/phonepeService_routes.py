@@ -1,6 +1,13 @@
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
+import os
 import uuid
-from fastapi import APIRouter, HTTPException, Path
+import base64
+import hashlib
+import json
+import requests
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 from models.payment import Payment, PaymentRequestModel, PhonePeCallback
 from models.userSubscription import UserSubscription
 from bson import ObjectId
@@ -8,34 +15,84 @@ from db.mongodb import db
 
 router = APIRouter()
 
-PHONEPE_MERCHANT_ID = "YOUR_MERCHANT_ID"
-PHONEPE_SALT_KEY = "YOUR_SALT_KEY"
-PHONEPE_BASE_URL = "https://api-preprod.phonepe.com/apis/pg-sandbox"  # Use sandbox URL
-REDIRECT_URL = "https://yourdomain.com/payment/success"
-BASE_URL = "http://127.0.0.1:8000/subscription"
+# PhonePe Credentials & Config
+PHONEPE_MERCHANT_ID = os.getenv("PHONEPE_MERCHANT_ID")
+PHONEPE_SALT_KEY = os.getenv("PHONEPE_SALT_KEY")
+PHONEPE_SALT_INDEX = os.getenv("PHONEPE_SALT_INDEX")
+PHONEPE_BASE_URL = os.getenv("PHONEPE_BASE_URL")
+FRONTEND_URL = os.getenv("FRONTEND_URL")
+BACKEND_CALLBACK_URL = os.getenv("BACKEND_CALLBACK_URL")
+
+
+class PhonePeSimulateRequest(BaseModel):
+    orderId: str
+    action: str  # "SUCCESS" or "FAILED"
+
+
+async def activate_subscription_for_payment(payment: dict):
+    """
+    Activates user subscription after payment is verified as successful.
+    Guarantees idempotency by checking if subscription for payment already exists.
+    """
+    payment_id = str(payment["_id"]) if "_id" in payment else payment.get("id")
+    user_id = str(payment["userId"])
+    plan_id = str(payment["subscriptionPackageId"])
+
+    # 1. Check if subscription already created for this paymentId
+    existing_sub = await db.userSubscriptions.find_one({"paymentId": payment_id})
+    if existing_sub:
+        return existing_sub
+
+    # 2. Fetch user
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    created_by_username = user.get("username", "system") if user else "system"
+
+    # 3. Fetch subscription plan
+    plan = await db.subscriptionPackages.find_one({"_id": ObjectId(plan_id)})
+    if not plan:
+        raise HTTPException(status_code=404, detail="Subscription plan not found.")
+
+    # 4. Check for existing latest subscription (active or expired)
+    last_subscription = await db.userSubscriptions.find_one(
+        {"userId": user_id},
+        sort=[("endDate", -1)]
+    )
+
+    # 5. Determine new start date & end date
+    current_utc = datetime.utcnow()
+    if last_subscription and last_subscription.get("endDate") and last_subscription["endDate"] > current_utc:
+        start_date = last_subscription["endDate"]
+    else:
+        start_date = current_utc
+
+    end_date = start_date + timedelta(days=30 * plan["durationMonth"])
+
+    # 6. Create new subscription
+    subscription = UserSubscription(
+        id="",
+        userId=user_id,
+        subscriptionPackageId=plan_id,
+        startDate=start_date,
+        endDate=end_date,
+        isActive=True,
+        status="ACTIVE",
+        paymentId=payment_id,
+        createdBy=created_by_username,
+    )
+
+    sub_dict = subscription.dict(exclude_none=True)
+    res = await db.userSubscriptions.insert_one(sub_dict)
+    sub_dict["id"] = str(res.inserted_id)
+    return sub_dict
+
 
 @router.post("/payment/phonepe-initiate")
 async def initiate_phonepe_payment(payment_req: PaymentRequestModel):
     try:
-        order_id = f"ORDER_{uuid.uuid4().hex[:10].upper()}"
-        amount_in_paise = int(payment_req.amount * 100)
+        order_id = f"ORD_{uuid.uuid4().hex[:12].upper()}"
 
-        # Construct the payment payload for PhonePe
-        payload = {
-            "merchantId": PHONEPE_MERCHANT_ID,
-            "merchantTransactionId": order_id,
-            "merchantUserId": str(payment_req.userId),
-            "amount": amount_in_paise,
-            "callbackUrl": f"{BASE_URL}/payment/phonepe-callback",
-            "mobileNumber": "9999999999",  # Optional
-            "paymentInstrument": {
-                "type": "PAY_PAGE"
-            }
-        }
-
-        # Store payment record in DB
+        # 1. Store INITIATED payment record in DB
         payment = Payment(
-            id=None,
             orderId=order_id,
             amount=payment_req.amount,
             status="INITIATED",
@@ -43,50 +100,105 @@ async def initiate_phonepe_payment(payment_req: PaymentRequestModel):
             userId=payment_req.userId,
             paymentDate=datetime.utcnow(),
             providerTransactionId=None,
-            paymentMode=None
+            paymentMode="PhonePe"
         )
-        await db.payments.insert_one(payment.dict(exclude_none=True))
+        payment_dict = payment.dict(exclude_none=True)
+        await db.payments.insert_one(payment_dict)
 
-        return { "url": f"https://securegw.phonepe.com/v3/checkout/{order_id}" }
+        # 2. Redirect user to interactive PhonePe payment page
+        checkout_url = f"{FRONTEND_URL}/payment/phonepe-checkout?orderId={order_id}"
+        return {"url": checkout_url, "orderId": order_id}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/payment/phonepe-callback")
-async def phonepe_callback(callback: PhonePeCallback):
+
+@router.post("/payment/phonepe-simulate")
+async def simulate_phonepe_action(req: PhonePeSimulateRequest):
     try:
-        # Update payment record with success
-        result = await db.payments.update_one(
-            {"orderId": callback.orderId},
+        payment = await db.payments.find_one({"orderId": req.orderId})
+        if not payment:
+            raise HTTPException(status_code=404, detail="Payment order not found")
+
+        status = "SUCCESS" if req.action.upper() == "SUCCESS" else "FAILED"
+        provider_txn_id = f"T{datetime.utcnow().strftime('%y%m%d')}{uuid.uuid4().hex[:8].upper()}" if status == "SUCCESS" else None
+
+        await db.payments.update_one(
+            {"orderId": req.orderId},
             {
                 "$set": {
-                    "status": callback.status,
-                    "providerTransactionId": callback.providerReferenceId,
-                    "paymentMode": "Phonepe",
-                    "paymentDate": datetime.utcnow(),
+                    "status": status,
+                    "providerTransactionId": provider_txn_id,
+                    "paymentMode": "PhonePe",
+                    "paymentDate": datetime.utcnow()
                 }
             }
         )
 
-        if callback.status == "SUCCESS":
-            # Create user subscription
-            plan = await db.subscriptionPackages.find_one({"_id": ObjectId(callback.subscriptionPackageId)})
-            end_date = datetime.utcnow() + timedelta(days=30 * plan["durationMonth"])
+        return {"orderId": req.orderId, "status": status, "providerTransactionId": provider_txn_id}
 
-            subscription = UserSubscription(
-                userId=callback.userId,
-                subscriptionPackageId=callback.subscriptionPackageId,
-                startDate=datetime.utcnow(),
-                endDate=end_date,
-                isActive=True,
-                createdBy="phonepe",
-                modifiedBy="phonepe",
-                createdAt=datetime.utcnow(),
-                modifiedAt=datetime.utcnow()
-            )
-            await db.userSubscriptions.insert_one(subscription.dict(exclude_none=True))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        return {"message": "Payment processed successfully"}
+
+@router.get("/payment/status/{order_id}")
+async def check_phonepe_payment_status(order_id: str):
+    try:
+        payment = await db.payments.find_one({"orderId": order_id})
+        if not payment:
+            raise HTTPException(status_code=404, detail="Payment record not found")
+
+        payment_status = payment.get("status", "FAILED")
+        provider_txn_id = payment.get("providerTransactionId")
+
+        if payment_status == "SUCCESS":
+            await activate_subscription_for_payment(payment)
+
+        return {
+            "orderId": order_id,
+            "status": payment_status,
+            "amount": payment.get("amount"),
+            "providerTransactionId": provider_txn_id
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/payment/phonepe-callback")
+async def phonepe_callback(request: Request):
+    try:
+        body = await request.json()
+        response_base64 = body.get("response")
+
+        if response_base64:
+            decoded_bytes = base64.b64decode(response_base64)
+            decoded_json = json.loads(decoded_bytes.decode('utf-8'))
+
+            order_id = decoded_json.get("data", {}).get("merchantTransactionId")
+            code = decoded_json.get("code")
+            provider_ref_id = decoded_json.get("data", {}).get("providerReferenceId")
+
+            if order_id:
+                status = "SUCCESS" if code == "PAYMENT_SUCCESS" else "FAILED"
+                await db.payments.update_one(
+                    {"orderId": order_id},
+                    {
+                        "$set": {
+                            "status": status,
+                            "providerTransactionId": provider_ref_id,
+                            "paymentMode": "PhonePe",
+                            "paymentDate": datetime.utcnow()
+                        }
+                    }
+                )
+
+                if status == "SUCCESS":
+                    payment = await db.payments.find_one({"orderId": order_id})
+                    if payment:
+                        await activate_subscription_for_payment(payment)
+
+        return {"message": "PhonePe callback processed successfully"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -138,6 +138,18 @@ async def get_latest_user_subscription(user_id: str):
         current["id"] = str(current["_id"])
         current.pop("_id", None)
         return current
+
+    # 3. Else return the most recent subscription (even if expired)
+    latest = await db.userSubscriptions.find_one(
+        {"userId": user_id},
+        sort=[("endDate", -1)]
+    )
+
+    if latest:
+        latest["id"] = str(latest["_id"])
+        latest.pop("_id", None)
+        return latest
+
     raise HTTPException(status_code=404, detail="No subscription found")
 
 @router.post("/settings/update-payment-gateway")
