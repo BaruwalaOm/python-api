@@ -6,6 +6,7 @@ from models.subscriptionPackage import  GatewayUpdateRequest, SubscriptionPackag
 from models.userSubscription import UserSubscription
 from bson import ObjectId
 from db.mongodb import db
+from services.subscription_service import expire_due_subscriptions
 
 router = APIRouter()
 
@@ -107,6 +108,7 @@ async def get_all_user_subscriptions():
 
 @router.get("/user-subscriptions/latest/{user_id}", response_model=UserSubscription)
 async def get_latest_user_subscription(user_id: str):
+    await expire_due_subscriptions(user_id)
     now = datetime.utcnow()
 
     # 1. Check for future (upcoming) subscription
