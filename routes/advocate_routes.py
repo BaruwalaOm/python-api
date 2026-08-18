@@ -8,6 +8,7 @@ from db.mongodb import db
 from models.client import Client
 from models.case import Case, HearingEntry, Note
 from models.user import User
+from services.reminder_service import notify_hearing_date_changed
 
 router = APIRouter()
 UPLOAD_DIR = "uploads/"
@@ -225,6 +226,7 @@ async def update_case(case_id: str, case: Case):
         existing_case = await db.cases.find_one({"_id": ObjectId(case_id)})
         if not existing_case:
             raise HTTPException(status_code=404, detail="Case not found")
+        old_hearing_date = existing_case.get("hearingDate")
 
         new_docs = []
         existing_doc_signatures = set(
@@ -257,6 +259,14 @@ async def update_case(case_id: str, case: Case):
             )
 
         updated_case = await db.cases.find_one({"_id": ObjectId(case_id)})
+        new_hearing_date = updated_case.get("hearingDate")
+        if (
+            isinstance(old_hearing_date, datetime)
+            and isinstance(new_hearing_date, datetime)
+            and old_hearing_date != new_hearing_date
+        ):
+            await notify_hearing_date_changed(updated_case, old_hearing_date, new_hearing_date, case.modifiedBy or case.createdBy)
+
         case_docs = updated_case.get("caseDocuments", [])
         for doc in case_docs:
             if "_id" in doc:
@@ -394,6 +404,7 @@ async def update_hearing(case_id: str, data: HearingEntry):
         case = await db.cases.find_one({"_id": ObjectId(case_id)})
         if not case:
             raise HTTPException(status_code=404, detail="Case not found")
+        old_hearing_date = case.get("hearingDate")
 
         # 1. Update next hearing date if provided
         update_fields = {}
@@ -424,6 +435,14 @@ async def update_hearing(case_id: str, data: HearingEntry):
 
         # 4. Update embedded case in clients collection
         updated_case = await db.cases.find_one({"_id": ObjectId(case_id)})
+        new_hearing_date = updated_case.get("hearingDate")
+        if (
+            isinstance(old_hearing_date, datetime)
+            and isinstance(new_hearing_date, datetime)
+            and old_hearing_date != new_hearing_date
+        ):
+            await notify_hearing_date_changed(updated_case, old_hearing_date, new_hearing_date, data.updatedBy)
+
         updated_case["id"] = str(updated_case["_id"])
         updated_case.pop("_id", None)
 
