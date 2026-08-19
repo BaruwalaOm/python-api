@@ -34,6 +34,7 @@ class Case(BaseEntity):
     caseStatus: str = "Open"
     opponant: str
     oppositeAdvocate: str
+    oppositeAdvId: Optional[str] = None
     caseRemark: str  
     caseDocuments: Optional[List[CaseDocument]] = []
     hearingHistory: Optional[List[HearingEntry]] = []

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
 from pymongo.errors import DuplicateKeyError
 
 from db.mongodb import db
@@ -10,6 +11,28 @@ HEARING_REMINDER_DAYS = {
     7: ("hearing_7_days", "Hearing in 7 days"),
     1: ("hearing_1_day", "Hearing tomorrow"),
     0: ("hearing_morning", "Hearing today"),
+}
+
+HEARING_NOTIFICATION_TYPES = {
+    "hearing_date_changed",
+    *(reminder_type for reminder_type, _ in HEARING_REMINDER_DAYS.values()),
+}
+
+
+NOTIFICATION_FIELDS = {
+    "_id",
+    "recipientId",
+    "recipientRole",
+    "title",
+    "message",
+    "type",
+    "relatedCaseId",
+    "relatedTaskId",
+    "readAt",
+    "dedupeKey",
+    "channels",
+    "createdAt",
+    "createdBy",
 }
 
 
@@ -36,9 +59,51 @@ def user_can_access_case(case: Dict[str, Any], user_id: str, role: str) -> bool:
     return False
 
 
+async def notification_matches_user(notification: Dict[str, Any], user_id: str, role: str) -> bool:
+    normalized_role = (role or "").lower()
+    recipient_role = (notification.get("recipientRole") or "").lower()
+    if notification.get("recipientId") != user_id:
+        return False
+    if normalized_role in {"advocate", "client"} and recipient_role != normalized_role:
+        return False
+
+    related_case_id = notification.get("relatedCaseId")
+    if related_case_id and ObjectId.is_valid(str(related_case_id)):
+        case = await db.cases.find_one({"_id": ObjectId(str(related_case_id))})
+        if case:
+            if normalized_role == "advocate" and (
+                case.get("advocateId") == user_id or case.get("oppositeAdvId") == user_id
+            ):
+                return True
+            if normalized_role == "client" and case.get("clientId") == user_id:
+                return True
+
+    related_task_id = notification.get("relatedTaskId")
+    if related_task_id and ObjectId.is_valid(str(related_task_id)):
+        task = await db.tasks.find_one({"_id": ObjectId(str(related_task_id))})
+        if task:
+            if normalized_role == "advocate" and task.get("advocateId") == user_id:
+                return True
+            if normalized_role == "client" and task.get("clientId") == user_id:
+                return True
+
+    return normalized_role == "admin"
+
+
+async def trim_notification_fields() -> None:
+    unset_fields = {}
+    async for notification in db.notifications.find({}):
+        extra_fields = set(notification.keys()) - NOTIFICATION_FIELDS
+        for field in extra_fields:
+            unset_fields[field] = ""
+    if unset_fields:
+        await db.notifications.update_many({}, {"$unset": unset_fields})
+
+
 async def ensure_reminder_indexes() -> None:
     await db.notifications.create_index("dedupeKey", unique=True)
     await db.notifications.create_index([("recipientId", 1), ("createdAt", -1)])
+    await db.notifications.create_index([("recipientId", 1), ("recipientRole", 1), ("createdAt", -1)])
     await db.tasks.create_index([("caseId", 1), ("dueDate", 1)])
     await db.tasks.create_index([("advocateId", 1), ("dueDate", 1)])
     await db.tasks.create_index([("clientId", 1), ("dueDate", 1)])
@@ -54,8 +119,6 @@ async def create_notification(
     dedupe_key: str,
     related_case_id: Optional[str] = None,
     related_task_id: Optional[str] = None,
-    hearing_date: Optional[datetime] = None,
-    due_date: Optional[datetime] = None,
     created_by: Optional[str] = "system",
 ) -> Optional[str]:
     now = datetime.utcnow()
@@ -67,8 +130,6 @@ async def create_notification(
         "type": notification_type,
         "relatedCaseId": related_case_id,
         "relatedTaskId": related_task_id,
-        "hearingDate": hearing_date,
-        "dueDate": due_date,
         "readAt": None,
         "dedupeKey": dedupe_key,
         "channels": {
@@ -78,9 +139,7 @@ async def create_notification(
             "whatsapp": "pending",
         },
         "createdBy": created_by,
-        "modifiedBy": created_by,
         "createdAt": now,
-        "modifiedAt": now,
     }
 
     try:
@@ -105,6 +164,19 @@ async def notify_hearing_date_changed(
     new_label = new_hearing_date.strftime("%d %b %Y")
     dedupe_key = f"hearing-change:{case_id}:{new_hearing_date.isoformat()}:{client_id}"
 
+    await db.notifications.update_many(
+        {
+            "relatedCaseId": case_id,
+            "type": {"$in": list(HEARING_NOTIFICATION_TYPES)},
+        },
+        {
+            "$set": {
+                "title": "Hearing date updated",
+                "message": f"{case.get('caseTitle', 'Case')} hearing is now scheduled for {new_label}.",
+            }
+        },
+    )
+
     await create_notification(
         recipient_id=client_id,
         recipient_role="Client",
@@ -112,7 +184,6 @@ async def notify_hearing_date_changed(
         message=f"{case.get('caseTitle', 'Your case')} hearing changed from {old_label} to {new_label}.",
         notification_type="hearing_date_changed",
         related_case_id=case_id,
-        hearing_date=new_hearing_date,
         dedupe_key=dedupe_key,
         created_by=actor or "system",
     )
@@ -139,20 +210,25 @@ async def run_reminder_scan() -> Dict[str, int]:
         case_id = str(case["_id"])
         recipients = [
             (case.get("advocateId"), "Advocate"),
+            (case.get("oppositeAdvId"), "Advocate"),
             (case.get("clientId"), "Client"),
         ]
 
+        seen_recipients = set()
         for recipient_id, role in recipients:
-            if not recipient_id:
+            if not recipient_id or (recipient_id, role) in seen_recipients:
                 continue
+            seen_recipients.add((recipient_id, role))
             notification_id = await create_notification(
                 recipient_id=recipient_id,
                 recipient_role=role,
                 title=title,
-                message=f"{case.get('caseTitle', 'Case')} is listed at {case.get('courtLocation', 'court')}.",
+                message=(
+                    f"{case.get('caseTitle', 'Case')} hearing is scheduled for "
+                    f"{hearing_date.strftime('%d %b %Y')} at {case.get('courtLocation', 'court')}."
+                ),
                 notification_type=reminder_type,
                 related_case_id=case_id,
-                hearing_date=hearing_date,
                 dedupe_key=f"hearing:{case_id}:{hearing_date.isoformat()}:{reminder_type}:{recipient_id}",
             )
             if notification_id:
@@ -195,7 +271,6 @@ async def run_reminder_scan() -> Dict[str, int]:
                 notification_type=reminder_type,
                 related_case_id=task.get("caseId"),
                 related_task_id=task_id,
-                due_date=due_date,
                 dedupe_key=f"task:{task_id}:{dedupe_suffix}:{recipient_id}",
             )
             if notification_id:

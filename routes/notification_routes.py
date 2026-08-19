@@ -9,8 +9,10 @@ from models.task import Task
 from services.reminder_service import (
     create_notification,
     get_upcoming_deadlines,
+    notification_matches_user,
     run_reminder_scan,
     serialize_doc,
+    trim_notification_fields,
     user_can_access_case,
 )
 
@@ -33,8 +35,15 @@ async def list_notifications(
     limit: int = Query(default=20, ge=1, le=100),
 ):
     await run_reminder_scan()
+    await trim_notification_fields()
+    normalized_role = role.lower()
     notifications = []
-    async for item in db.notifications.find({"recipientId": userId}).sort("createdAt", -1).limit(limit):
+    query = {"recipientId": userId}
+    if normalized_role in {"advocate", "client"}:
+        query["recipientRole"] = {"$in": [normalized_role, normalized_role.capitalize()]}
+    async for item in db.notifications.find(query).sort("createdAt", -1).limit(limit):
+        if not await notification_matches_user(item, userId, role):
+            continue
         notifications.append(serialize_doc(item))
     return notifications
 
@@ -42,7 +51,15 @@ async def list_notifications(
 @router.get("/notifications/unread-count")
 async def unread_count(userId: str = Query(...), role: str = Query(...)):
     await run_reminder_scan()
-    count = await db.notifications.count_documents({"recipientId": userId, "readAt": None})
+    await trim_notification_fields()
+    normalized_role = role.lower()
+    query = {"recipientId": userId, "readAt": None}
+    if normalized_role in {"advocate", "client"}:
+        query["recipientRole"] = {"$in": [normalized_role, normalized_role.capitalize()]}
+    count = 0
+    async for item in db.notifications.find(query):
+        if await notification_matches_user(item, userId, role):
+            count += 1
     return {"count": count}
 
 
@@ -52,7 +69,7 @@ async def mark_notification_read(notification_id: str, userId: str = Query(...))
         raise HTTPException(status_code=400, detail="Invalid notification ID")
     result = await db.notifications.update_one(
         {"_id": ObjectId(notification_id), "recipientId": userId},
-        {"$set": {"readAt": datetime.utcnow(), "modifiedAt": datetime.utcnow()}},
+        {"$set": {"readAt": datetime.utcnow()}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Notification not found")
@@ -63,7 +80,7 @@ async def mark_notification_read(notification_id: str, userId: str = Query(...))
 async def mark_all_notifications_read(userId: str = Query(...)):
     await db.notifications.update_many(
         {"recipientId": userId, "readAt": None},
-        {"$set": {"readAt": datetime.utcnow(), "modifiedAt": datetime.utcnow()}},
+        {"$set": {"readAt": datetime.utcnow()}},
     )
     return {"message": "Notifications marked as read"}
 
@@ -138,7 +155,6 @@ async def create_task(task: Task, userId: str = Query(...), role: str = Query(..
             notification_type="task_created",
             related_case_id=task.caseId,
             related_task_id=str(task_dict["_id"]),
-            due_date=task.dueDate,
             dedupe_key=f"task-created:{str(task_dict['_id'])}:{case['clientId']}",
             created_by=userId,
         )
