@@ -28,6 +28,7 @@ class Case(BaseEntity):
     caseNumber: str
     hearingDate: datetime
     courtLocation: str
+    subCourt: Optional[str] = None
     caseParentId: Optional[str] = None
     filingDate: datetime = Field(default_factory=datetime.utcnow)
     caseStatus: str = "Open"
