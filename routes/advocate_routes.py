@@ -1,9 +1,10 @@
 from datetime import datetime
 import os
+import re
 import shutil
-from typing import List, Literal
+from typing import List, Literal, Optional
 from bson import ObjectId
-from fastapi import APIRouter, Body, HTTPException, Request, UploadFile, File, Form, Depends
+from fastapi import APIRouter, Body, HTTPException, Query, Request, UploadFile, File, Form, Depends
 from db.mongodb import db
 from models.client import Client
 from models.case import Case, HearingEntry, Note
@@ -199,6 +200,59 @@ async def update_client_status(client_id: str, is_active: Literal[True, False] =
 
     return {"message": "Status updated", "isActive": is_active}
 # ---------------------------------Case-------------------------------
+
+@router.get("/public/case-status/search")
+async def search_public_case_status(
+    state: str = Query(..., min_length=1),
+    district: str = Query(..., min_length=1),
+    courtComplex: str = Query(..., min_length=1),
+    caseNumber: Optional[str] = Query(None),
+    advocate: Optional[str] = Query(None),
+):
+    escaped_court_complex = re.escape(courtComplex.strip())
+
+    query = {
+        "$or": [
+            {"courtLocation": {"$regex": escaped_court_complex, "$options": "i"}},
+            {"subCourt": {"$regex": escaped_court_complex, "$options": "i"}},
+        ],
+    }
+
+    if caseNumber and caseNumber.strip():
+        query["caseNumber"] = {"$regex": f"^{re.escape(caseNumber.strip())}$", "$options": "i"}
+    elif advocate and advocate.strip():
+        escaped_advocate = re.escape(advocate.strip())
+        query["$and"] = [{
+            "$or": [
+                {"advocateId": {"$regex": escaped_advocate, "$options": "i"}},
+                {"oppositeAdvId": {"$regex": escaped_advocate, "$options": "i"}},
+                {"oppositeAdvocate": {"$regex": escaped_advocate, "$options": "i"}},
+                {"createdBy": {"$regex": escaped_advocate, "$options": "i"}},
+            ]
+        }]
+    else:
+        raise HTTPException(status_code=400, detail="Case number or advocate is required")
+
+    cases = []
+    async for case in db.cases.find(query):
+        cases.append({
+            "caseNumber": case.get("caseNumber", ""),
+            "caseTitle": case.get("caseTitle", ""),
+            "caseDetail": case.get("caseDetail", ""),
+            "caseStatus": case.get("caseStatus", ""),
+            "nextHearingDate": case.get("hearingDate"),
+            "courtLocation": case.get("courtLocation", ""),
+            "subCourt": case.get("subCourt", ""),
+            "filingDate": case.get("filingDate"),
+            "opponent": case.get("opponant", ""),
+            "oppositeAdvocate": case.get("oppositeAdvocate", ""),
+            "hearingHistory": case.get("hearingHistory", []),
+        })
+
+    if not cases:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    return {"cases": cases}
 
 @router.post("/add-case")
 async def add_case(case: Case):
